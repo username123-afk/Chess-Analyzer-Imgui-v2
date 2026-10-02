@@ -10,7 +10,6 @@
 #include <atomic>
 #include <algorithm>
 #include <chrono>
-#include <cfloat>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -55,6 +54,7 @@ struct Shared {
     std::string fen, bm, ev, pv, sfStatus = "STOCKFISH: STARTING", scanStatus = "WAITING FOR FIRST SCAN";
     int evalDepth = 0, scans = 0, analyses = 0;
     bool learned = false;
+    std::string turn = "--";
 };
 static Shared S;
 static const uint64_t HOLD_MS = 6000;   // keep last good board/FEN/arrow this long when recognition fails
@@ -93,16 +93,12 @@ static void logChange(std::string& last, const std::string& msg) { if (msg != la
 
 static void writeState(const vision::BoardDetect& bd, const std::string& fen, const std::string& bm,
                        const std::string& ev, int depth, bool ok, const std::string& why) {
-    std::string tmp = std::string(STATE) + ".tmp";
-    {
-    std::ofstream f(tmp, std::ios::trunc);
-    std::string w = why; for (char& c : w) if (c == '"' || c == '\\') c = '\''; else if (c == '\n' || c == '\r') c = ' ';
+    std::ofstream f(STATE);
+    std::string w = why; for (char& c : w) if (c == '"') c = '\'';
     f << "{\n  \"ok\": " << (ok ? "true" : "false") << ",\n  \"fen\": \"" << fen << "\",\n  \"bestmove\": \"" << bm
       << "\",\n  \"evaluation\": \"" << ev << "\",\n  \"depth\": " << depth << ",\n  \"board_x\": " << bd.x
       << ", \"board_y\": " << bd.y << ", \"board_w\": " << bd.size << ", \"board_h\": " << bd.size
       << ",\n  \"reason\": \"" << w << "\"\n}\n";
-    }
-    rename(tmp.c_str(), STATE);   // readers never see a half-written file
 }
 
 // ------------------------------------------------------------------ learn diagnostics
@@ -174,19 +170,12 @@ static void dumpLearnDebug(const vision::Image& im, const vision::BoardDetect& b
 // ------------------------------------------------------------------ scanning
 struct ScanOut {
     bool ok = false; vision::BoardDetect bd; bool bdFound = false; bool wb = true;
+    chess::Board board;
     std::string fen, why; int imgW = 0, imgH = 0;
 };
 struct ScanCtx {
     vision::Recognizer rec; vision::BoardDetect lastBd; bool haveBd = false;
     std::string lastLearnLog, lastBoardLog;
-    int trackFail = 0;   // consecutive failed frames on a tracked board -> force full re-detection
-    // A locked-on wrong rectangle used to be re-confirmed forever by verifyBoard(); after 3 failed frames
-    // drop the lock so the next scan runs full detection again.
-    bool trackFail_bump(bool tracked) {
-        if (!tracked) { trackFail = 0; return false; }
-        if (++trackFail >= 3) { haveBd = false; trackFail = 0; return true; }
-        return false;
-    }
 };
 
 static ScanOut scanOnce(ScanCtx& cx, const Settings& c, bool forceLearn) {
@@ -225,7 +214,6 @@ static ScanOut scanOnce(ScanCtx& cx, const Settings& c, bool forceLearn) {
             std::string t = "recognition: template learning failed: " + le;
             logChange(cx.lastLearnLog, t);
             dumpLearnDebug(im, bd);
-            cx.trackFail_bump(tracked);
             if (!cx.rec.learned()) return so;
         }
     }
@@ -245,11 +233,10 @@ static ScanOut scanOnce(ScanCtx& cx, const Settings& c, bool forceLearn) {
     }
     cx.rec.maxDist = savedDist;
     if (!gotOk) {
+        cx.haveBd = false;   // do not keep trusting a tracked rectangle that cannot be read: re-detect next scan
         so.why = "PIECE RECOGNITION FAILED: " + bestRr.why;
-        cx.trackFail_bump(tracked);
         return so;
     }
-    cx.trackFail = 0;
 
     // 4) orientation + validation
     int o;
@@ -259,12 +246,9 @@ static ScanOut scanOnce(ScanCtx& cx, const Settings& c, bool forceLearn) {
     } else o = c.orientation;
     so.wb = (o == 1);
     chess::Board board = vision::gridToBoard(bestRr.grid, so.wb);
-    char stm = c.sideToMove == 0 ? 'w' : 'b';
     std::string why;
-    if (!chess::validateFull(board, stm, why)) { so.why = "POSITION INVALID (not analysed): " + why; return so; }
-    std::string cast = chess::sanitizeCastling(board, c.castling);
-    std::string ep = chess::sanitizeEp(board, stm, c.enPassant);
-    so.fen = chess::fen(board, stm, cast, ep);
+    if (!chess::validate(board, true, false, why)) { so.why = "POSITION INVALID (not analysed): " + why; return so; }
+    so.board = board;   // side to move + full legality check + FEN are done by the worker (needs history)
     so.ok = true;
     return so;
 }
@@ -281,6 +265,8 @@ static void worker() {
     std::string candFen, analyzedFen, lastFail, lastFenLog;
     int candCount = 0, analyzedDepth = 0;
     bool wasGood = false;
+    // side-to-move tracking: remembers the previous accepted position
+    bool trHave = false; chess::Board trPrev; char trStm = 'w'; std::string lastTurnLog;
 
     auto setSf = [&](const std::string& s) { std::lock_guard<std::mutex> lk(S.m); S.sfStatus = s; };
     auto startEngine = [&](const Settings& c) -> bool {
@@ -306,8 +292,7 @@ static void worker() {
         uint64_t now = nowMs();
         bool scanNow = g_reqScan.exchange(false), reanalyze = g_reqReanalyze.exchange(false), learn = g_reqLearn.exchange(false);
         if (!c.analyzer) {
-            { std::lock_guard<std::mutex> lk(S.m); S.scanStatus = "ANALYZER OFF"; }   // never sleep holding the UI's mutex
-            usleep(100000); continue;
+            std::lock_guard<std::mutex> lk(S.m); S.scanStatus = "ANALYZER OFF"; usleep(100000); continue;
         }
         bool due = c.autoAnalyze && now >= nextScan;
         if (!(due || scanNow || reanalyze || learn)) { usleep(25000); continue; }
@@ -316,6 +301,39 @@ static void worker() {
 
         ScanOut so = scanOnce(cx, c, learn);
         now = nowMs();
+        if (so.ok) {
+            // ---- side to move. AUTO: whoever just moved is the side whose pieces appeared on changed squares.
+            char stm; std::string how;
+            if (c.sideToMove >= 0) { stm = c.sideToMove ? 'b' : 'w'; how = "manual"; }
+            else if (!trHave) {
+                stm = (so.board == chess::startBoard()) ? 'w' : (so.wb ? 'w' : 'b');
+                how = "first position: assuming the side at the bottom";
+            } else if (so.board == trPrev) { stm = trStm; how = "unchanged"; }
+            else {
+                int wn = 0, bn = 0;
+                for (int i = 0; i < 64; i++)
+                    if (so.board.sq[i] != trPrev.sq[i] && so.board.sq[i] != '.') (chess::isWhite(so.board.sq[i]) ? wn : bn)++;
+                if (wn && !bn) { stm = 'b'; how = "white just moved"; }
+                else if (bn && !wn) { stm = 'w'; how = "black just moved"; }
+                else { stm = trStm; how = "several moves since last scan, kept"; }
+            }
+            std::string why;
+            if (!chess::validateFull(so.board, stm, why)) {
+                char alt = stm == 'w' ? 'b' : 'w'; std::string why2;
+                if (c.sideToMove < 0 && chess::validateFull(so.board, alt, why2)) { stm = alt; how += "; flipped because the other side was illegal"; }
+                else { so.ok = false; so.why = "POSITION INVALID (not analysed): " + why; }
+            }
+            if (so.ok) {
+                std::string cast = chess::sanitizeCastling(so.board, c.castling);
+                std::string ep = chess::sanitizeEp(so.board, stm, c.enPassant);
+                so.fen = chess::fen(so.board, stm, cast, ep);
+                trHave = true; trPrev = so.board; trStm = stm;
+                std::string turn = std::string(stm == 'w' ? "WHITE" : "BLACK") + (c.sideToMove < 0 ? " (auto)" : " (manual)");
+                { std::lock_guard<std::mutex> lk(S.m); S.turn = turn; }
+                std::string tl = std::string("side to move: ") + (stm == 'w' ? "white" : "black") + " [" + how + "]";
+                if (turn != lastTurnLog) { LOG("%s", tl.c_str()); lastTurnLog = turn; }
+            }
+        }
         {
             std::lock_guard<std::mutex> lk(S.m);
             S.scans++; S.learned = cx.rec.learned();
@@ -352,11 +370,10 @@ static void worker() {
             lastFenLog = so.fen;
         }
         wasGood = true;
-        // position differs from the analysed one: the old arrow is wrong now, drop it right away
-        if (so.fen != analyzedFen) { std::lock_guard<std::mutex> lk(S.m); S.bm.clear(); S.ev.clear(); S.pv.clear(); }
         if (!(changed || reanalyze) || candCount < need) continue;
 
         // ---- analysis
+        if (so.fen != analyzedFen) { std::lock_guard<std::mutex> lk(S.m); S.bm.clear(); S.ev.clear(); S.pv.clear(); }
         if (!eng.running()) {
             if (now < engineRetryAt && !reanalyze) { setSf("STOCKFISH: ERROR: engine down, retrying"); continue; }
             LOG("stockfish: engine not running, restarting");
@@ -365,7 +382,7 @@ static void worker() {
         setSf("STOCKFISH: ANALYZING");
         LOG("analysis start: depth=%d fen=%s", c.depth, so.fen.c_str());
         uint64_t t0 = nowMs();
-        sf::Result r = eng.analyze(so.fen, c.sideToMove ? 'b' : 'w', c.depth, 15000 + c.depth * 1000);
+        sf::Result r = eng.analyze(so.fen, so.fen.find(" b ") != std::string::npos ? 'b' : 'w', c.depth, 15000 + c.depth * 1000);
         uint64_t dt = nowMs() - t0;
         if (r.ok && !r.bestmove.empty()) {
             LOG("bestmove %s eval=%s depth=%d (%llu ms) pv=%s", r.bestmove.c_str(), r.eval.c_str(), r.depth, (unsigned long long)dt, r.pv.c_str());
@@ -459,9 +476,6 @@ int main() {
     ImGui::StyleColorsDark();
     ImGuiIO& io = ImGui::GetIO();
     io.IniFilename = nullptr;
-#if IMGUI_VERSION_NUM >= 18000
-    io.ConfigWindowsMoveFromTitleBarOnly = false;   // drag the panel by any empty spot with a finger
-#endif
     float scale = std::max(1.f, std::min((float)di.width, (float)di.height) / 540.f);
     ImGui::GetStyle().ScaleAllSizes(scale);
     ImGui::GetStyle().FramePadding = ImVec2(8 * scale, 7 * scale);
@@ -521,12 +535,12 @@ int main() {
 
         // ---- snapshot of worker state
         vision::BoardDetect bd; bool bdValid, wb; int imgW, imgH; uint64_t goodMs;
-        std::string fen, bm, ev, sfStatus, scanStatus; int evalDepth, scans, analyses; bool learned;
+        std::string fen, bm, ev, sfStatus, scanStatus, turn; int evalDepth, scans, analyses; bool learned;
         {
             std::lock_guard<std::mutex> lk(S.m);
             bd = S.bd; bdValid = S.bdValid; wb = S.wb; imgW = S.imgW; imgH = S.imgH; goodMs = S.lastGoodMs;
             fen = S.fen; bm = S.bm; ev = S.ev; sfStatus = S.sfStatus; scanStatus = S.scanStatus;
-            evalDepth = S.evalDepth; scans = S.scans; analyses = S.analyses; learned = S.learned;
+            evalDepth = S.evalDepth; scans = S.scans; analyses = S.analyses; learned = S.learned; turn = S.turn;
         }
 
         ImGui_ImplOpenGL3_NewFrame();
@@ -551,30 +565,17 @@ int main() {
 
         // ---- panel
         ImGui::SetNextWindowPos(ImVec2(20 * scale, 35 * scale), ImGuiCond_FirstUseEver);
-        ImGui::SetNextWindowSize(ImVec2(440 * scale, 0), ImGuiCond_FirstUseEver);   // user can resize afterwards
-        ImGui::SetNextWindowSizeConstraints(ImVec2(300 * scale, 120 * scale), ImVec2((float)di.width, (float)di.height));
+        ImGui::SetNextWindowSize(ImVec2(440 * scale, 0), ImGuiCond_Always);
         ImGui::Begin("CHESS ANALYZER");
         ImGui::TextWrapped("%s", sfStatus.c_str());
         ImGui::TextWrapped("BOARD: %s", scanStatus.c_str());
+        ImGui::Text("TURN: %s", turn.c_str());
         if (ui.showBestMove) ImGui::Text("BEST MOVE: %s", bm.empty() ? "--" : bm.c_str());
         if (ui.showEval) ImGui::Text("EVAL: %s  (d%d)", ev.empty() ? "--" : ev.c_str(), evalDepth);
         ImGui::TextWrapped("FEN: %s", fen.empty() ? "--" : fen.c_str());
         if (ImGui::Button("SCAN NOW")) g_reqScan = true;
         ImGui::SameLine();
         if (ImGui::Button("REANALYZE")) g_reqReanalyze = true;
-        // SAVE / EXIT always visible (not hidden inside a collapsed section)
-        syncUi();
-        bool dirty = ui.toJson() != savedJson;
-        if (ImGui::Button("SAVE SETTINGS")) {
-            syncUi();
-            saveOk = saveSettings(ui);
-            if (saveOk) savedJson = ui.toJson();
-            savedMsgUntil = now + 3000;
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("EXIT")) { LOG("exit requested from UI"); g_quit = true; }
-        if (now < savedMsgUntil) ImGui::Text("%s", saveOk ? "Settings saved" : "SAVE FAILED (see overlay.log)");
-        else if (dirty) ImGui::Text("(unsaved changes)");
 
         if (ImGui::CollapsingHeader("ANALYZER", ImGuiTreeNodeFlags_DefaultOpen)) {
             ImGui::Checkbox("ON", &ui.analyzer);
@@ -590,6 +591,7 @@ int main() {
             ImGui::RadioButton("WHITE", &ui.orientation, 1); ImGui::SameLine();
             ImGui::RadioButton("BLACK", &ui.orientation, 0);
             ImGui::Text("Side to move");
+            ImGui::RadioButton("AUTO##stm", &ui.sideToMove, -1); ImGui::SameLine();
             ImGui::RadioButton("WHITE##stm", &ui.sideToMove, 0); ImGui::SameLine();
             ImGui::RadioButton("BLACK##stm", &ui.sideToMove, 1);
             ImGui::Text("Castling");
@@ -606,7 +608,7 @@ int main() {
             ImGui::SliderFloat("Arrow opacity", &ui.arrowOpacity, .1f, 1.f, "%.2f");
             ImGui::SliderFloat("Arrow thickness", &ui.arrowThickness, 2.f, 24.f, "%.1f");
         }
-        if (ImGui::CollapsingHeader("MISC", ImGuiTreeNodeFlags_DefaultOpen)) {
+        if (ImGui::CollapsingHeader("MISC")) {
             ImGui::Text("%s", touch.describe().c_str());
             ImGui::Text("Touch rotation");
             ImGui::RadioButton("AUTO##r", &rotIdx, 0); ImGui::SameLine();
@@ -614,6 +616,18 @@ int main() {
             ImGui::RadioButton("90", &rotIdx, 2); ImGui::SameLine();
             ImGui::RadioButton("180", &rotIdx, 3); ImGui::SameLine();
             ImGui::RadioButton("270", &rotIdx, 4);
+            syncUi();                                  // make sure `ui` reflects every widget edited so far this frame
+            bool dirty = ui.toJson() != savedJson;
+            if (ImGui::Button("SAVE SETTINGS")) {
+                syncUi();                              // ...and again, immediately before writing
+                saveOk = saveSettings(ui);
+                if (saveOk) savedJson = ui.toJson();
+                savedMsgUntil = now + 3000;
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("EXIT")) { LOG("exit requested from UI"); g_quit = true; }
+            if (now < savedMsgUntil) ImGui::Text("%s", saveOk ? "Settings saved" : "SAVE FAILED (see overlay.log)");
+            else if (dirty) ImGui::Text("(unsaved changes)");
         }
         ImGui::End();
 

@@ -6,7 +6,7 @@ struct Settings {
     int depth = 12;
     float scanInterval = 0.8f, arrowOpacity = 0.75f, arrowThickness = 10.f;
     int orientation = -1;          // -1 auto, 1 white at bottom, 0 black at bottom
-    int sideToMove = 0;            // 0 white, 1 black
+    int sideToMove = -1;           // -1 auto (inferred from the last move), 0 white, 1 black
     std::string castling = "KQkq"; // subset of KQkq or "-"
     std::string enPassant = "-";   // "-" or file letter a-h
     int touchRotation = -1;        // -1 auto, 0/90/180/270

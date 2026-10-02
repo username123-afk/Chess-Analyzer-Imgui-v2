@@ -37,10 +37,9 @@ bool parseRawScreencap(const std::vector<uint8_t>& buf, Image& out, std::string&
 
 // ---------------------------------------------------------------- board detection
 struct Col { int r, g, b; };
-static inline int colDist(const uint8_t* p, const Col& c) {
-    return iabs(p[0] - c.r) + iabs(p[1] - c.g) + iabs(p[2] - c.b);
+static inline bool nearCol(const uint8_t* p, const Col& c, int tol) {
+    return iabs(p[0] - c.r) + iabs(p[1] - c.g) + iabs(p[2] - c.b) < tol;
 }
-static inline bool nearCol(const uint8_t* p, const Col& c, int tol) { return colDist(p, c) < tol; }
 static const int kTol = 24;
 static const int kSamples = 6;
 static const float kOff[kSamples][2] = {{.5f,.07f},{.5f,.93f},{.07f,.5f},{.93f,.5f},{.15f,.85f},{.85f,.15f}};
@@ -57,11 +56,7 @@ static int gridScore(const Image& im, const Col& A, const Col& B, float bx, floa
                 int px = std::min(im.w - 1, (int)(bx + (c + kOff[k][0]) * s));
                 int py = std::min(im.h - 1, (int)(by + (r + kOff[k][1]) * s));
                 const uint8_t* p = im.at(px, py);
-                // A sample only votes for a colour if it is within tol of it AND closer to it than to the
-                // other colour. Without the "closer" rule two similar dark greys (UI header / move list)
-                // both match everywhere and a flat region scored ~100% as a "checkerboard".
-                int da = colDist(p, A), db = colDist(p, B);
-                bool a = da < tol && da < db, b = db < tol && db < da;
+                bool a = nearCol(p, A, tol), b = nearCol(p, B, tol);
                 if (even ? a : b) sx++;
                 if (even ? b : a) sy++;
             }
@@ -117,8 +112,9 @@ static BoardDetect detectBoardTol(const Image& im, int tol, float thr) {
         for (size_t j = i + 1; j < cols.size(); j++) {
             const Col &A = cols[i], &B = cols[j];
             int cd = iabs(A.r - B.r) + iabs(A.g - B.g) + iabs(A.b - B.b);
-            if (cd < 24 || cd > 450) continue;
-            if (cd < tol * 3 / 2) continue;   // the two square colours must be clearly distinguishable at this tolerance
+            // The two square colours must be further apart than the match tolerance, otherwise two
+            // near-identical dark UI greys 'match' every pixel and any dark area looks like a board.
+            if (cd < std::max(24, 2 * tol + 8) || cd > 450) continue;
             std::vector<int> rowc(H, 0), colc(W, 0);
             for (int y = 0; y < im.h; y += stride)
                 for (int x = 0; x < im.w; x += stride) {
@@ -139,6 +135,7 @@ static BoardDetect detectBoardTol(const Image& im, int tol, float thr) {
             float x0 = xs * stride, x1 = xe * stride + stride, y0 = ys * stride, y1 = ye * stride + stride;
             float w = x1 - x0, h = y1 - y0;
             if (std::min(w, h) < 0.25f * std::min(im.w, im.h)) continue;
+            if (std::max(w, h) / std::min(w, h) > 1.6f) {}  // tolerated: refinement searches sizes
 
             // The colour-run bounding box is usually the exact board rectangle. The grid score is flat
             // near the optimum (a few px off scores about the same), so a blind search can settle ~10px
@@ -212,6 +209,7 @@ BoardDetect detectBoard(const Image& im) {
 bool verifyBoard(const Image& im, BoardDetect& bd) {
     if (!bd.found || im.w < 200 || im.h < 200) return false;
     Col A{bd.ca[0], bd.ca[1], bd.ca[2]}, B{bd.cb[0], bd.cb[1], bd.cb[2]};
+    if (iabs(A.r - B.r) + iabs(A.g - B.g) + iabs(A.b - B.b) < 2 * 48 + 8) return false;  // not trackable -> full re-detect
     int best = gridScore(im, A, B, bd.x, bd.y, bd.size, 48); float bx = bd.x, by = bd.y, bs = bd.size;
     const int need = best + 3;   // only move for a clear gain, otherwise the rectangle would creep
     int cur = best;
@@ -275,6 +273,8 @@ SqFeat analyzeSquare(const Image& im, float x0, float y0, float s) {
     for (int c = 0; c < N * N; c++) {
         float d = std::fabs(col[c][0] - bg[0]) + std::fabs(col[c][1] - bg[1]) + std::fabs(col[c][2] - bg[2]);
         fg[c] = d > 120.f;
+        int cx = c % N, cy = c / N;
+        if (std::min(std::min(cx, cy), std::min(N - 1 - cx, N - 1 - cy)) < 2) fg[c] = 0;   // margin: ignore neighbour bleed
     }
     // flood from border through non-fg cells -> "outside"; enclosed holes become part of the piece
     memset(outside, 0, sizeof(outside));

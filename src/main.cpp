@@ -74,6 +74,19 @@ static bool capture(vision::Image& im, std::string& err) {
     if (rc != 0) { err = "screencap exited with status " + std::to_string(rc); return false; }
     return vision::parseRawScreencap(b, im, err);
 }
+// A FLAG_SECURE window is captured by screencap as solid black. Detect that so the log/UI say so
+// instead of a misleading "board not found".
+static bool captureLooksBlank(const vision::Image& im) {
+    if (im.w < 16 || im.h < 16) return false;
+    int bright = 0, n = 0;
+    for (int y = 0; y < im.h; y += std::max(1, im.h / 48))
+        for (int x = 0; x < im.w; x += std::max(1, im.w / 48)) {
+            const uint8_t* p = im.at(x, y);
+            n++;
+            if (p[0] > 12 || p[1] > 12 || p[2] > 12) bright++;
+        }
+    return bright * 100 < n;   // fewer than 1% of sampled pixels are non-black
+}
 // log only when the message changes (never per-frame / per-scan spam)
 static void logChange(std::string& last, const std::string& msg) { if (msg != last) { LOG("%s", msg.c_str()); last = msg; } }
 
@@ -168,6 +181,10 @@ static ScanOut scanOnce(ScanCtx& cx, const Settings& c, bool forceLearn) {
     vision::Image im;
     if (!capture(im, err)) { so.why = "CAPTURE FAILED: " + err; return so; }
     so.imgW = im.w; so.imgH = im.h;
+    if (captureLooksBlank(im)) {
+        so.why = "CAPTURE IS BLACK: the app on screen probably uses FLAG_SECURE (screenshots blocked)";
+        return so;
+    }
 
     // 1) board: cheap tracking of the previous rectangle first, full tolerant detection otherwise
     vision::BoardDetect bd;

@@ -459,6 +459,9 @@ int main() {
     ImGui::StyleColorsDark();
     ImGuiIO& io = ImGui::GetIO();
     io.IniFilename = nullptr;
+#if IMGUI_VERSION_NUM >= 18000
+    io.ConfigWindowsMoveFromTitleBarOnly = false;   // drag the panel by any empty spot with a finger
+#endif
     float scale = std::max(1.f, std::min((float)di.width, (float)di.height) / 540.f);
     ImGui::GetStyle().ScaleAllSizes(scale);
     ImGui::GetStyle().FramePadding = ImVec2(8 * scale, 7 * scale);
@@ -548,7 +551,8 @@ int main() {
 
         // ---- panel
         ImGui::SetNextWindowPos(ImVec2(20 * scale, 35 * scale), ImGuiCond_FirstUseEver);
-        ImGui::SetNextWindowSize(ImVec2(440 * scale, 0), ImGuiCond_Always);
+        ImGui::SetNextWindowSize(ImVec2(440 * scale, 0), ImGuiCond_FirstUseEver);   // user can resize afterwards
+        ImGui::SetNextWindowSizeConstraints(ImVec2(300 * scale, 120 * scale), ImVec2((float)di.width, (float)di.height));
         ImGui::Begin("CHESS ANALYZER");
         ImGui::TextWrapped("%s", sfStatus.c_str());
         ImGui::TextWrapped("BOARD: %s", scanStatus.c_str());
@@ -558,6 +562,19 @@ int main() {
         if (ImGui::Button("SCAN NOW")) g_reqScan = true;
         ImGui::SameLine();
         if (ImGui::Button("REANALYZE")) g_reqReanalyze = true;
+        // SAVE / EXIT always visible (not hidden inside a collapsed section)
+        syncUi();
+        bool dirty = ui.toJson() != savedJson;
+        if (ImGui::Button("SAVE SETTINGS")) {
+            syncUi();
+            saveOk = saveSettings(ui);
+            if (saveOk) savedJson = ui.toJson();
+            savedMsgUntil = now + 3000;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("EXIT")) { LOG("exit requested from UI"); g_quit = true; }
+        if (now < savedMsgUntil) ImGui::Text("%s", saveOk ? "Settings saved" : "SAVE FAILED (see overlay.log)");
+        else if (dirty) ImGui::Text("(unsaved changes)");
 
         if (ImGui::CollapsingHeader("ANALYZER", ImGuiTreeNodeFlags_DefaultOpen)) {
             ImGui::Checkbox("ON", &ui.analyzer);
@@ -589,7 +606,7 @@ int main() {
             ImGui::SliderFloat("Arrow opacity", &ui.arrowOpacity, .1f, 1.f, "%.2f");
             ImGui::SliderFloat("Arrow thickness", &ui.arrowThickness, 2.f, 24.f, "%.1f");
         }
-        if (ImGui::CollapsingHeader("MISC")) {
+        if (ImGui::CollapsingHeader("MISC", ImGuiTreeNodeFlags_DefaultOpen)) {
             ImGui::Text("%s", touch.describe().c_str());
             ImGui::Text("Touch rotation");
             ImGui::RadioButton("AUTO##r", &rotIdx, 0); ImGui::SameLine();
@@ -597,18 +614,6 @@ int main() {
             ImGui::RadioButton("90", &rotIdx, 2); ImGui::SameLine();
             ImGui::RadioButton("180", &rotIdx, 3); ImGui::SameLine();
             ImGui::RadioButton("270", &rotIdx, 4);
-            syncUi();                                  // make sure `ui` reflects every widget edited so far this frame
-            bool dirty = ui.toJson() != savedJson;
-            if (ImGui::Button("SAVE SETTINGS")) {
-                syncUi();                              // ...and again, immediately before writing
-                saveOk = saveSettings(ui);
-                if (saveOk) savedJson = ui.toJson();
-                savedMsgUntil = now + 3000;
-            }
-            ImGui::SameLine();
-            if (ImGui::Button("EXIT")) { LOG("exit requested from UI"); g_quit = true; }
-            if (now < savedMsgUntil) ImGui::Text("%s", saveOk ? "Settings saved" : "SAVE FAILED (see overlay.log)");
-            else if (dirty) ImGui::Text("(unsaved changes)");
         }
         ImGui::End();
 

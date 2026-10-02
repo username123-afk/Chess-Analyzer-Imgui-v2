@@ -87,6 +87,72 @@ static void writeState(const vision::BoardDetect& bd, const std::string& fen, co
       << ",\n  \"reason\": \"" << w << "\"\n}\n";
 }
 
+// ------------------------------------------------------------------ learn diagnostics
+// When template learning fails, log what each square looked like and save a picture of the
+// screenshot with the detected 8x8 grid drawn in red (open it in any gallery / MT Manager).
+static bool writeDebugBmp(const vision::Image& src, const vision::BoardDetect& bd, const char* path) {
+    const int D = 2;
+    int w = src.w / D, h = src.h / D;
+    if (w < 8 || h < 8) return false;
+    int rowBytes = (w * 3 + 3) & ~3;
+    std::vector<uint8_t> px((size_t)rowBytes * h, 0);
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++) {
+            const uint8_t* p = src.at(x * D, y * D);
+            uint8_t* o = &px[(size_t)y * rowBytes + x * 3];
+            o[0] = p[2]; o[1] = p[1]; o[2] = p[0];
+        }
+    auto dot = [&](int x, int y) {
+        for (int k = 0; k < 2; k++) {
+            int xx = x + k, yy = y + k;
+            if (xx < 0 || yy < 0 || xx >= w || yy >= h) continue;
+            uint8_t* o = &px[(size_t)yy * rowBytes + xx * 3];
+            o[0] = 0; o[1] = 0; o[2] = 255;   // red (BGR)
+        }
+    };
+    float s = bd.size / 8.f;
+    for (int i = 0; i <= 8; i++) {
+        for (int t = 0; t <= (int)(bd.size / D); t++) {
+            dot((int)((bd.x + i * s) / D), (int)(bd.y / D) + t);
+            dot((int)(bd.x / D) + t, (int)((bd.y + i * s) / D));
+        }
+    }
+    uint8_t hdr[54] = {0};
+    uint32_t fileSize = 54 + (uint32_t)px.size();
+    int32_t bw = w, bh = -h;   // negative = top-down
+    hdr[0] = 'B'; hdr[1] = 'M';
+    memcpy(hdr + 2, &fileSize, 4);
+    uint32_t off = 54, dib = 40; uint16_t planes = 1, bpp = 24;
+    memcpy(hdr + 10, &off, 4); memcpy(hdr + 14, &dib, 4);
+    memcpy(hdr + 18, &bw, 4); memcpy(hdr + 22, &bh, 4);
+    memcpy(hdr + 26, &planes, 2); memcpy(hdr + 28, &bpp, 2);
+    FILE* f = fopen(path, "wb");
+    if (!f) return false;
+    fwrite(hdr, 1, 54, f); fwrite(px.data(), 1, px.size(), f);
+    fclose(f);
+    return true;
+}
+static void dumpLearnDebug(const vision::Image& im, const vision::BoardDetect& bd) {
+    static uint64_t last = 0;
+    uint64_t n = nowMs();
+    if (last && n - last < 10000) return;   // at most once per 10 s
+    last = n;
+    float s = bd.size / 8.f;
+    std::string rows;
+    for (int r = 0; r < 8; r++) {
+        for (int c = 0; c < 8; c++) {
+            vision::SqFeat f = vision::analyzeSquare(im, bd.x + c * s, bd.y + r * s, s);
+            rows += f.bad ? '?' : (f.empty ? '.' : 'P');
+        }
+        if (r < 7) rows += '/';
+    }
+    LOG("learn debug: board x=%.0f y=%.0f size=%.0f square=%.1f image=%dx%d", bd.x, bd.y, bd.size, s, im.w, im.h);
+    LOG("learn debug: seen     (top->bottom, P=piece .=empty ?=unreadable): %s", rows.c_str());
+    LOG("learn debug: expected (start position, either orientation):        PPPPPPPP/PPPPPPPP/......../......../......../......../PPPPPPPP/PPPPPPPP");
+    bool ok = writeDebugBmp(im, bd, "/data/adb/chess_analyzer/run/debug_board.bmp");
+    LOG("learn debug: wrote /data/adb/chess_analyzer/run/debug_board.bmp (%s) - red grid should sit exactly on the 8x8 squares", ok ? "ok" : "FAILED");
+}
+
 // ------------------------------------------------------------------ scanning
 struct ScanOut {
     bool ok = false; vision::BoardDetect bd; bool bdFound = false; bool wb = true;
@@ -128,6 +194,7 @@ static ScanOut scanOnce(ScanCtx& cx, const Settings& c, bool forceLearn) {
             so.why = "NEED TEMPLATES: open a game showing the START position, then LEARN (" + le + ")";
             std::string t = "recognition: template learning failed: " + le;
             logChange(cx.lastLearnLog, t);
+            dumpLearnDebug(im, bd);
             if (!cx.rec.learned()) return so;
         }
     }

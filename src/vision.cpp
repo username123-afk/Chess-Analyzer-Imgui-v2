@@ -135,6 +135,21 @@ static BoardDetect detectBoardTol(const Image& im, int tol, float thr) {
             if (std::min(w, h) < 0.25f * std::min(im.w, im.h)) continue;
             if (std::max(w, h) / std::min(w, h) > 1.6f) {}  // tolerated: refinement searches sizes
 
+            // The colour-run bounding box is usually the exact board rectangle. The grid score is flat
+            // near the optimum (a few px off scores about the same), so a blind search can settle ~10px
+            // off, which makes pieces bleed into neighbouring squares. Try the exact box first and make
+            // every other candidate beat it by a clear margin.
+            int margin = 0;
+            if (std::max(w, h) / std::min(w, h) < 1.05f) {
+                float S0 = (w + h) * 0.5f;
+                int sc = gridScore(im, A, B, x0, y0, S0, tol);
+                if (sc > bestScore) {
+                    bestScore = sc; bd.x = x0; bd.y = y0; bd.size = S0;
+                    bd.ca[0]=A.r; bd.ca[1]=A.g; bd.ca[2]=A.b; bd.cb[0]=B.r; bd.cb[1]=B.g; bd.cb[2]=B.b;
+                    margin = (int)(0.02f * 64 * kSamples);
+                }
+            }
+
             float sizes[3] = {w, h, (w + h) * 0.5f};
             for (float S0 : sizes)
                 for (int oxi = 0; oxi < 2; oxi++)
@@ -146,7 +161,7 @@ static BoardDetect detectBoardTol(const Image& im, int tol, float thr) {
                             for (float dy = -d; dy <= d; dy += st)
                                 for (float dx = -d; dx <= d; dx += st) {
                                     int sc = gridScore(im, A, B, ox + dx, oy + dy, S, tol);
-                                    if (sc > bestScore) {
+                                    if (sc > bestScore + margin) {
                                         bestScore = sc; bd.x = ox + dx; bd.y = oy + dy; bd.size = S;
                                         bd.ca[0]=A.r; bd.ca[1]=A.g; bd.ca[2]=A.b; bd.cb[0]=B.r; bd.cb[1]=B.g; bd.cb[2]=B.b;
                                     }
@@ -160,7 +175,7 @@ static BoardDetect detectBoardTol(const Image& im, int tol, float thr) {
                     for (int dy = -2; dy <= 2; dy++)
                         for (int dx = -2; dx <= 2; dx++) {
                             int sc = gridScore(im, A, B, bx + dx, by + dy, bs + ds, tol);
-                            if (sc > bestScore) { bestScore = sc; bd.x = bx + dx; bd.y = by + dy; bd.size = bs + ds;
+                            if (sc > bestScore + margin) { bestScore = sc; bd.x = bx + dx; bd.y = by + dy; bd.size = bs + ds;
                                 bd.ca[0]=A.r; bd.ca[1]=A.g; bd.ca[2]=A.b; bd.cb[0]=B.r; bd.cb[1]=B.g; bd.cb[2]=B.b; }
                         }
             }
@@ -192,14 +207,17 @@ BoardDetect detectBoard(const Image& im) {
 bool verifyBoard(const Image& im, BoardDetect& bd) {
     if (!bd.found || im.w < 200 || im.h < 200) return false;
     Col A{bd.ca[0], bd.ca[1], bd.ca[2]}, B{bd.cb[0], bd.cb[1], bd.cb[2]};
-    int best = -1; float bx = bd.x, by = bd.y, bs = bd.size;
+    int best = gridScore(im, A, B, bd.x, bd.y, bd.size, 48); float bx = bd.x, by = bd.y, bs = bd.size;
+    const int need = best + 3;   // only move for a clear gain, otherwise the rectangle would creep
+    int cur = best;
     for (int ds = -1; ds <= 1; ds++)
         for (int dy = -3; dy <= 3; dy++)
             for (int dx = -3; dx <= 3; dx++) {
                 float S = bd.size * (1.f + 0.01f * ds);
                 int sc = gridScore(im, A, B, bd.x + dx, bd.y + dy, S, 48);
-                if (sc > best) { best = sc; bx = bd.x + dx; by = bd.y + dy; bs = S; }
+                if (sc >= need && sc > best) { best = sc; bx = bd.x + dx; by = bd.y + dy; bs = S; }
             }
+    (void)cur;
     if (best < (int)(0.55f * bd.maxScore)) return false;
     bd.x = bx; bd.y = by; bd.size = bs; bd.score = best;
     return true;

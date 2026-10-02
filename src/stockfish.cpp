@@ -3,6 +3,9 @@
 #include <cerrno>
 #include <chrono>
 #include <csignal>
+#include <cstdio>
+#include <cstdlib>
+#include <fcntl.h>
 #include <poll.h>
 #include <sstream>
 #include <sys/prctl.h>
@@ -23,7 +26,10 @@ bool Engine::start(const std::string& path, std::string& err) {
     if (access(path.c_str(), X_OK) != 0) chmod(path.c_str(), 0755);
     if (access(path.c_str(), X_OK) != 0) { err = "binary not executable: " + path; return false; }
     int a[2], b[2];
-    if (pipe(a) || pipe(b)) { err = "pipe() failed"; return false; }
+    // O_CLOEXEC: other children we spawn (popen("screencap")) must not inherit the engine's pipe ends,
+    // otherwise closing our end never gives Stockfish EOF. dup2() below clears the flag on fds 0/1/2.
+    if (pipe2(a, O_CLOEXEC)) { err = "pipe() failed"; return false; }
+    if (pipe2(b, O_CLOEXEC)) { close(a[0]); close(a[1]); err = "pipe() failed"; return false; }
     pid_t pid = fork();
     if (pid < 0) { close(a[0]); close(a[1]); close(b[0]); close(b[1]); err = "fork() failed"; return false; }
     if (pid == 0) {

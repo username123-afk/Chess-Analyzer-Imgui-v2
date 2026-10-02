@@ -1,5 +1,6 @@
 #include "chess_core.h"
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 namespace chess {
 Board::Board() { std::fill(sq, sq + 64, '.'); }

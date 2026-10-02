@@ -37,9 +37,10 @@ bool parseRawScreencap(const std::vector<uint8_t>& buf, Image& out, std::string&
 
 // ---------------------------------------------------------------- board detection
 struct Col { int r, g, b; };
-static inline bool nearCol(const uint8_t* p, const Col& c, int tol) {
-    return iabs(p[0] - c.r) + iabs(p[1] - c.g) + iabs(p[2] - c.b) < tol;
+static inline int colDist(const uint8_t* p, const Col& c) {
+    return iabs(p[0] - c.r) + iabs(p[1] - c.g) + iabs(p[2] - c.b);
 }
+static inline bool nearCol(const uint8_t* p, const Col& c, int tol) { return colDist(p, c) < tol; }
 static const int kTol = 24;
 static const int kSamples = 6;
 static const float kOff[kSamples][2] = {{.5f,.07f},{.5f,.93f},{.07f,.5f},{.93f,.5f},{.15f,.85f},{.85f,.15f}};
@@ -56,7 +57,11 @@ static int gridScore(const Image& im, const Col& A, const Col& B, float bx, floa
                 int px = std::min(im.w - 1, (int)(bx + (c + kOff[k][0]) * s));
                 int py = std::min(im.h - 1, (int)(by + (r + kOff[k][1]) * s));
                 const uint8_t* p = im.at(px, py);
-                bool a = nearCol(p, A, tol), b = nearCol(p, B, tol);
+                // A sample only votes for a colour if it is within tol of it AND closer to it than to the
+                // other colour. Without the "closer" rule two similar dark greys (UI header / move list)
+                // both match everywhere and a flat region scored ~100% as a "checkerboard".
+                int da = colDist(p, A), db = colDist(p, B);
+                bool a = da < tol && da < db, b = db < tol && db < da;
                 if (even ? a : b) sx++;
                 if (even ? b : a) sy++;
             }
@@ -113,6 +118,7 @@ static BoardDetect detectBoardTol(const Image& im, int tol, float thr) {
             const Col &A = cols[i], &B = cols[j];
             int cd = iabs(A.r - B.r) + iabs(A.g - B.g) + iabs(A.b - B.b);
             if (cd < 24 || cd > 450) continue;
+            if (cd < tol * 3 / 2) continue;   // the two square colours must be clearly distinguishable at this tolerance
             std::vector<int> rowc(H, 0), colc(W, 0);
             for (int y = 0; y < im.h; y += stride)
                 for (int x = 0; x < im.w; x += stride) {
@@ -133,7 +139,6 @@ static BoardDetect detectBoardTol(const Image& im, int tol, float thr) {
             float x0 = xs * stride, x1 = xe * stride + stride, y0 = ys * stride, y1 = ye * stride + stride;
             float w = x1 - x0, h = y1 - y0;
             if (std::min(w, h) < 0.25f * std::min(im.w, im.h)) continue;
-            if (std::max(w, h) / std::min(w, h) > 1.6f) {}  // tolerated: refinement searches sizes
 
             // The colour-run bounding box is usually the exact board rectangle. The grid score is flat
             // near the optimum (a few px off scores about the same), so a blind search can settle ~10px

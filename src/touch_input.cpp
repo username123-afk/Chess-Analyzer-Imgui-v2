@@ -34,9 +34,9 @@ bool TouchInput::init(int W, int H, int rotation) {
         if (fd < 0) continue;
         unsigned char abs[ABS_MAX / 8 + 1] = {0}, prop[INPUT_PROP_MAX / 8 + 1] = {0};
         ioctl(fd, EVIOCGBIT(EV_ABS, sizeof abs), abs);
-        ioctl(fd, EVIOCGPROP(sizeof prop), prop);
+        bool propOk = ioctl(fd, EVIOCGPROP(sizeof prop), prop) >= 0;
         bool mt = testBit(abs, ABS_MT_POSITION_X) && testBit(abs, ABS_MT_POSITION_Y);
-        bool direct = testBit(prop, INPUT_PROP_DIRECT);
+        bool direct = !propOk || testBit(prop, INPUT_PROP_DIRECT);   // old kernels lack EVIOCGPROP
         char name[128] = "?"; ioctl(fd, EVIOCGNAME(sizeof name), name);
         if (!mt || !direct) { close(fd); continue; }       // keep only touchscreens
         input_absinfo ax{}, ay{};
@@ -84,9 +84,9 @@ void TouchInput::poll(std::vector<Event>& out) {
                     else if (d.slot == 0) {   // follow the first finger only
                         if (e.code == ABS_MT_POSITION_X) { d.rawX = e.value; d.moved = true; }
                         else if (e.code == ABS_MT_POSITION_Y) { d.rawY = e.value; d.moved = true; }
-                        else if (e.code == ABS_MT_TRACKING_ID) d.down = e.value >= 0;
+                        else if (e.code == ABS_MT_TRACKING_ID) { d.down = e.value >= 0; d.hasTid = true; }
                     }
-                } else if (e.type == EV_KEY && e.code == BTN_TOUCH) {
+                } else if (e.type == EV_KEY && e.code == BTN_TOUCH && !d.hasTid) {   // BTN_TOUCH stays 1 while a 2nd finger is down
                     d.down = e.value != 0;
                 } else if (e.type == EV_SYN && e.code == SYN_REPORT) {
                     float x, y; map(d, x, y);

@@ -17,7 +17,7 @@ private:
     struct Dev {
         int fd = -1; std::string path, name;
         int minx = 0, maxx = 0, miny = 0, maxy = 0;
-        int slot = 0, rawX = 0, rawY = 0; bool down = false, wasDown = false, moved = false;
+        int slot = 0, rawX = 0, rawY = 0; bool down = false, wasDown = false, moved = false, hasTid = false;
     };
     void map(const Dev& d, float& x, float& y) const;
     std::vector<Dev> devs_;

@@ -26,8 +26,8 @@ void Settings::clamp() {
 
 std::string Settings::toJson() const {
     auto b = [](bool v) { return v ? "true" : "false"; };
-    char buf[1400];
-    snprintf(buf, sizeof buf,
+    std::string buf(1400 + stockfishPath.size() + castling.size() + enPassant.size(), '\0');
+    int n = snprintf(&buf[0], buf.size(),
         "{\n"
         "  \"analyzer_enabled\": %s,\n  \"auto_analyze\": %s,\n  \"show_best_move\": %s,\n"
         "  \"show_arrow\": %s,\n  \"show_highlights\": %s,\n  \"show_evaluation\": %s,\n"
@@ -38,6 +38,7 @@ std::string Settings::toJson() const {
         b(analyzer), b(autoAnalyze), b(showBestMove), b(showArrow), b(showHighlights), b(showEval),
         depth, scanInterval, arrowOpacity, arrowThickness, orientation, sideToMove,
         castling.c_str(), enPassant.c_str(), touchRotation, stockfishPath.c_str());
+    buf.resize(n > 0 ? std::min((size_t)n, buf.size() - 1) : 0);
     return buf;
 }
 

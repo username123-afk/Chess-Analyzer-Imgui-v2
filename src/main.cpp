@@ -10,6 +10,7 @@
 #include <atomic>
 #include <algorithm>
 #include <chrono>
+#include <cfloat>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -92,12 +93,16 @@ static void logChange(std::string& last, const std::string& msg) { if (msg != la
 
 static void writeState(const vision::BoardDetect& bd, const std::string& fen, const std::string& bm,
                        const std::string& ev, int depth, bool ok, const std::string& why) {
-    std::ofstream f(STATE);
-    std::string w = why; for (char& c : w) if (c == '"') c = '\'';
+    std::string tmp = std::string(STATE) + ".tmp";
+    {
+    std::ofstream f(tmp, std::ios::trunc);
+    std::string w = why; for (char& c : w) if (c == '"' || c == '\\') c = '\''; else if (c == '\n' || c == '\r') c = ' ';
     f << "{\n  \"ok\": " << (ok ? "true" : "false") << ",\n  \"fen\": \"" << fen << "\",\n  \"bestmove\": \"" << bm
       << "\",\n  \"evaluation\": \"" << ev << "\",\n  \"depth\": " << depth << ",\n  \"board_x\": " << bd.x
       << ", \"board_y\": " << bd.y << ", \"board_w\": " << bd.size << ", \"board_h\": " << bd.size
       << ",\n  \"reason\": \"" << w << "\"\n}\n";
+    }
+    rename(tmp.c_str(), STATE);   // readers never see a half-written file
 }
 
 // ------------------------------------------------------------------ learn diagnostics
@@ -174,6 +179,14 @@ struct ScanOut {
 struct ScanCtx {
     vision::Recognizer rec; vision::BoardDetect lastBd; bool haveBd = false;
     std::string lastLearnLog, lastBoardLog;
+    int trackFail = 0;   // consecutive failed frames on a tracked board -> force full re-detection
+    // A locked-on wrong rectangle used to be re-confirmed forever by verifyBoard(); after 3 failed frames
+    // drop the lock so the next scan runs full detection again.
+    bool trackFail_bump(bool tracked) {
+        if (!tracked) { trackFail = 0; return false; }
+        if (++trackFail >= 3) { haveBd = false; trackFail = 0; return true; }
+        return false;
+    }
 };
 
 static ScanOut scanOnce(ScanCtx& cx, const Settings& c, bool forceLearn) {
@@ -212,6 +225,7 @@ static ScanOut scanOnce(ScanCtx& cx, const Settings& c, bool forceLearn) {
             std::string t = "recognition: template learning failed: " + le;
             logChange(cx.lastLearnLog, t);
             dumpLearnDebug(im, bd);
+            cx.trackFail_bump(tracked);
             if (!cx.rec.learned()) return so;
         }
     }
@@ -230,7 +244,12 @@ static ScanOut scanOnce(ScanCtx& cx, const Settings& c, bool forceLearn) {
         }
     }
     cx.rec.maxDist = savedDist;
-    if (!gotOk) { so.why = "PIECE RECOGNITION FAILED: " + bestRr.why; return so; }
+    if (!gotOk) {
+        so.why = "PIECE RECOGNITION FAILED: " + bestRr.why;
+        cx.trackFail_bump(tracked);
+        return so;
+    }
+    cx.trackFail = 0;
 
     // 4) orientation + validation
     int o;
@@ -287,7 +306,8 @@ static void worker() {
         uint64_t now = nowMs();
         bool scanNow = g_reqScan.exchange(false), reanalyze = g_reqReanalyze.exchange(false), learn = g_reqLearn.exchange(false);
         if (!c.analyzer) {
-            std::lock_guard<std::mutex> lk(S.m); S.scanStatus = "ANALYZER OFF"; usleep(100000); continue;
+            { std::lock_guard<std::mutex> lk(S.m); S.scanStatus = "ANALYZER OFF"; }   // never sleep holding the UI's mutex
+            usleep(100000); continue;
         }
         bool due = c.autoAnalyze && now >= nextScan;
         if (!(due || scanNow || reanalyze || learn)) { usleep(25000); continue; }
@@ -332,10 +352,11 @@ static void worker() {
             lastFenLog = so.fen;
         }
         wasGood = true;
+        // position differs from the analysed one: the old arrow is wrong now, drop it right away
+        if (so.fen != analyzedFen) { std::lock_guard<std::mutex> lk(S.m); S.bm.clear(); S.ev.clear(); S.pv.clear(); }
         if (!(changed || reanalyze) || candCount < need) continue;
 
         // ---- analysis
-        if (so.fen != analyzedFen) { std::lock_guard<std::mutex> lk(S.m); S.bm.clear(); S.ev.clear(); S.pv.clear(); }
         if (!eng.running()) {
             if (now < engineRetryAt && !reanalyze) { setSf("STOCKFISH: ERROR: engine down, retrying"); continue; }
             LOG("stockfish: engine not running, restarting");
@@ -344,7 +365,7 @@ static void worker() {
         setSf("STOCKFISH: ANALYZING");
         LOG("analysis start: depth=%d fen=%s", c.depth, so.fen.c_str());
         uint64_t t0 = nowMs();
-        sf::Result r = eng.analyze(so.fen, so.fen.find(" b ") != std::string::npos ? 'b' : 'w', c.depth, 15000 + c.depth * 1000);
+        sf::Result r = eng.analyze(so.fen, c.sideToMove ? 'b' : 'w', c.depth, 15000 + c.depth * 1000);
         uint64_t dt = nowMs() - t0;
         if (r.ok && !r.bestmove.empty()) {
             LOG("bestmove %s eval=%s depth=%d (%llu ms) pv=%s", r.bestmove.c_str(), r.eval.c_str(), r.depth, (unsigned long long)dt, r.pv.c_str());
